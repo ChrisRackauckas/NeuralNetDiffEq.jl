@@ -363,3 +363,207 @@ eqs  = @. [(Dxx(u_(x,y)) + Dyy(u_(x,y))) for u_ in u] ~ -sin(pi*x)*sin(pi*y)*[0 
 # Initial and boundary conditions
 bcs = [u[1](x,0) ~ x, u[2](x,0) ~ 2, u[3](x,0) ~ 3, u[4](x,0) ~ 4]
 ```
+
+
+## Linear parabolic system of PDEs
+
+We can use NeuralPDE to solve the linear parabolic system of PDEs described here http://eqworld.ipmnet.ru/en/solutions/syspde/spde0101.pdf.
+
+```julia
+using NeuralPDE, Flux, ModelingToolkit, GalacticOptim, Optim, DiffEqFlux
+using Plots
+using Quadrature,Cubature
+import ModelingToolkit: Interval, infimum, supremum
+
+@parameters t, x
+@variables u(..), w(..)
+Dxx = Differential(x)^2
+Dt = Differential(t)
+
+# Constants
+a  = 1
+b1 = 4
+b2 = 2
+c1 = 3
+c2 = 1
+λ1 = (b1 + c2 + sqrt((b1 + c2)^2 + 4 * (b1 * c2 - b2 * c1))) / 2
+λ2 = (b1 + c2 - sqrt((b1 + c2)^2 + 4 * (b1 * c2 - b2 * c1))) / 2
+
+# Analytic solution
+θ(t, x) = exp(-t) * cos(x / a)
+u_analytic(t, x) = (b1 - λ2) / (b2 * (λ1 - λ2)) * exp(λ1 * t) * θ(t, x) - (b1 - λ1) / (b2 * (λ1 - λ2)) * exp(λ2 * t) * θ(t, x)
+w_analytic(t, x) = 1 / (λ1 - λ2) * (exp(λ1 * t) * θ(t, x) - exp(λ2 * t) * θ(t, x))
+
+# Second-order constant-coefficient linear parabolic system
+eqs = [Dt(u(x, t)) ~ a * Dxx(u(x, t)) + b1 * u(x, t) + c1 * w(x, t),
+       Dt(w(x, t)) ~ a * Dxx(w(x, t)) + b2 * u(x, t) + c2 * w(x, t)]
+
+# Boundary conditions
+bcs = [u(0, x) ~ u_analytic(0, x),
+       w(0, x) ~ w_analytic(0, x),
+       u(t, 0) ~ u_analytic(t, 0),
+       w(t, 0) ~ w_analytic(t, 0),
+       u(t, 1) ~ u_analytic(t, 1),
+       w(t, 1) ~ w_analytic(t, 1)]
+
+# Space and time domains
+domains = [x ∈ Interval(0.0, 1.0),
+           t ∈ Interval(0.0, 1.0)]
+
+# Neural network
+input_ = length(domains)
+n = 15
+chain = [FastChain(FastDense(input_, n, Flux.σ), FastDense(n, n, Flux.σ), FastDense(n, 1)) for _ in 1:2]
+initθ = map(c -> Float64.(c), DiffEqFlux.initial_params.(chain))
+
+_strategy = QuadratureTraining()
+discretization = PhysicsInformedNN(chain, _strategy, init_params=initθ)
+
+pde_system = PDESystem(eqs, bcs, domains, [t,x], [u,w])
+prob = discretize(pde_system, discretization)
+sym_prob = symbolic_discretize(pde_system, discretization)
+
+pde_inner_loss_functions = prob.f.f.loss_function.pde_loss_function.pde_loss_functions.contents
+bcs_inner_loss_functions = prob.f.f.loss_function.bcs_loss_function.bc_loss_functions.contents
+
+cb = function (p, l)
+    println("loss: ", l)
+    println("pde_losses: ", map(l_ -> l_(p), pde_inner_loss_functions))
+    println("bcs_losses: ", map(l_ -> l_(p), bcs_inner_loss_functions))
+    return false
+end
+
+res = GalacticOptim.solve(prob, BFGS(); cb=cb, maxiters=5000)
+
+phi = discretization.phi
+
+# Analysis
+ts, xs = [infimum(d.domain):0.01:supremum(d.domain) for d in domains]
+
+acum =  [0;accumulate(+, length.(initθ))]
+sep = [acum[i] + 1:acum[i + 1] for i in 1:length(acum) - 1]
+minimizers_ = [res.minimizer[s] for s in sep]
+
+analytic_sol_func(t,x) = [u_analytic(t, x), w_analytic(t, x)]
+u_real  = [[analytic_sol_func(t, x)[i] for t in ts for x in xs] for i in 1:2]
+u_predict  = [[phi[i]([t,x], minimizers_[i])[1] for t in ts  for x in xs] for i in 1:2]
+diff_u = [abs.(u_real[i] .- u_predict[i]) for i in 1:2]
+for i in 1:2
+    p1 = plot(ts, xs, u_real[i], linetype=:contourf, title="u$i, analytic");
+    p2 = plot(ts, xs, u_predict[i], linetype=:contourf, title="predict");
+    p3 = plot(ts, xs, diff_u[i], linetype=:contourf, title="error");
+    plot(p1, p2, p3)
+    savefig("sol_u$i")
+end
+```
+
+![linear_parabolic_sol_u1](https://user-images.githubusercontent.com/26853713/125745625-49c73760-0522-4ed4-9bdd-bcc567c9ace3.png)
+![linear_parabolic_sol_u2](https://user-images.githubusercontent.com/26853713/125745637-b12e1d06-e27b-46fe-89f3-076d415fcd7e.png)
+
+
+## Nonlinear elliptic system of PDEs
+
+We can also solve nonlinear systems such as the system of nonlinear elliptic PDEs described here http://eqworld.ipmnet.ru/en/solutions/syspde/spde3104.pdf. This is done using a derivative neural network approximation.
+
+```julia
+using NeuralPDE, Flux, ModelingToolkit, GalacticOptim, Optim, DiffEqFlux, DifferentialEquations, Roots
+using Plots
+using Quadrature,Cubature
+import ModelingToolkit: Interval, infimum, supremum
+
+@parameters x, y
+Dx = Differential(x)
+Dy = Differential(y)
+@variables Dxu(..), Dyu(..), Dxw(..), Dyw(..)
+@variables u(..), w(..)
+
+
+# Arbitrary functions
+f(x) = sin(x)
+g(x) = cos(x)
+h(x) = x
+root(x) = f(x) - g(x)
+
+# Analytic solution
+k = find_zero(root, (0, 1), Bisection())                            # k is a root of the algebraic (transcendental) equation f(x) = g(x)
+θ(x, y) = (cosh(sqrt(f(k)) * x) + sinh(sqrt(f(k)) * x)) * (y + 1)   # Analytical solution to Helmholtz equation
+w_analytic(x, y) = θ(x, y) - h(k) / f(k)
+u_analytic(x, y) = k * w_analytic(x, y)
+
+# Nonlinear Steady-State Systems of Two Reaction-Diffusion Equations with 3 arbitrary function f, g, h
+eqs_ = [Dx(Dxu(x, y)) + Dy(Dyu(x, y)) ~ u(x, y) * f(u(x, y) / w(x, y)) + u(x, y) / w(x, y) * h(u(x, y) / w(x, y)),
+       Dx(Dxw(x, y)) + Dy(Dyw(x, y)) ~ w(x, y) * g(u(x, y) / w(x, y)) + h(u(x, y) / w(x, y))]
+
+# Boundary conditions
+bcs_ = [u(0, y) ~ u_analytic(0, y),
+       u(1, y) ~ u_analytic(1, y),
+       u(x, 0) ~ u_analytic(x, 0),
+       w(0, y) ~ w_analytic(0, y),
+       w(1, y) ~ w_analytic(1, y),
+       w(x, 0) ~ w_analytic(x, 0)]
+
+der_ = [Dy(u(x, y)) ~ Dyu(x, y),
+       Dy(w(x, y)) ~ Dyw(x, y),
+       Dx(u(x, y)) ~ Dxu(x, y),
+       Dx(w(x, y)) ~ Dxw(x, y)]
+
+bcs__ = [bcs_;der_]
+
+# Space and time domains
+domains = [x ∈ Interval(0.0, 1.0),
+           y ∈ Interval(0.0, 1.0)]
+
+# Neural network
+input_ = length(domains)
+n = 15
+chain = [FastChain(FastDense(input_, n, Flux.σ), FastDense(n, n, Flux.σ), FastDense(n, 1)) for _ in 1:6] # 1:number of @variables
+initθ = map(c -> Float64.(c), DiffEqFlux.initial_params.(chain))
+
+_strategy = QuadratureTraining()
+discretization = PhysicsInformedNN(chain, _strategy, init_params=initθ)
+
+vars = [u,w,Dxu,Dyu,Dxw,Dyw]
+pde_system = PDESystem(eqs_, bcs__, domains, [x,y], vars)
+prob = NeuralPDE.discretize(pde_system, discretization)
+sym_prob = NeuralPDE.symbolic_discretize(pde_system, discretization)
+
+pde_inner_loss_functions = prob.f.f.loss_function.pde_loss_function.pde_loss_functions.contents
+inner_loss_functions = prob.f.f.loss_function.bcs_loss_function.bc_loss_functions.contents
+bcs_inner_loss_functions = inner_loss_functions[1:6]
+aprox_derivative_loss_functions = inner_loss_functions[7:end]
+
+cb = function (p, l)
+    println("loss: ", l)
+    println("pde_losses: ", map(l_ -> l_(p), pde_inner_loss_functions))
+    println("bcs_losses: ", map(l_ -> l_(p), bcs_inner_loss_functions))
+    println("der_losses: ", map(l_ -> l_(p), aprox_derivative_loss_functions))
+    return false
+end
+
+res = GalacticOptim.solve(prob, BFGS(); cb=cb, maxiters=5000)
+
+phi = discretization.phi
+
+# Analysis
+xs, ys = [infimum(d.domain):0.01:supremum(d.domain) for d in domains]
+
+acum =  [0;accumulate(+, length.(initθ))]
+sep = [acum[i] + 1:acum[i + 1] for i in 1:length(acum) - 1]
+minimizers_ = [res.minimizer[s] for s in sep]
+
+analytic_sol_func(x,y) = [u_analytic(x, y), w_analytic(x, y)]
+u_real  = [[analytic_sol_func(x, y)[i] for x in xs for y in ys] for i in 1:2]
+u_predict  = [[phi[i]([x,y], minimizers_[i])[1] for x in xs for y in ys] for i in 1:2]
+diff_u = [abs.(u_real[i] .- u_predict[i]) for i in 1:2]
+for i in 1:2
+    p1 = plot(xs, ys, u_real[i], linetype=:contourf, title="u$i, analytic");
+    p2 = plot(xs, ys, u_predict[i], linetype=:contourf, title="predict");
+    p3 = plot(xs, ys, diff_u[i], linetype=:contourf, title="error");
+    plot(p1, p2, p3)
+    savefig("non_linear_elliptic_sol_u$i")
+end
+```
+
+![non_linear_elliptic_sol_u1](https://user-images.githubusercontent.com/26853713/125745550-0b667c10-b09a-4659-a543-4f7a7e025d6c.png)
+![non_linear_elliptic_sol_u2](https://user-images.githubusercontent.com/26853713/125745571-45a04739-7838-40ce-b979-43b88d149028.png)
+
