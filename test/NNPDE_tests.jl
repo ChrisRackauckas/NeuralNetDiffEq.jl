@@ -553,3 +553,35 @@ p_ = res.minimizer[end-2:end]
 # u_predict  = [[discretization.phi[i]([t],minimizers[i])[1] for t in ts] for i in 1:3]
 # plot(sol)
 # plot!(ts, u_predict, label = ["x(t)" "y(t)" "z(t)"])
+
+@parameters t
+@variables i(..)
+Di = Differential(t)
+Ii = Integral(t, DomainSets.ClosedInterval(0, t))
+eq = Di(i(t)) + 2*i(t) + 5*Ii(i(t)) ~ 1
+bcs = [i(0.) ~ 0.0]
+domains = [t ∈ Interval(0.0,2.0)]
+chain = FastChain(FastDense(1,15,Flux.σ),FastDense(15,1))
+initθ = Float64.(DiffEqFlux.initial_params(chain))
+strategy_ = NeuralPDE.GridTraining(0.01)
+discretization = NeuralPDE.PhysicsInformedNN(chain,
+                                             strategy_;
+                                             init_params = nothing,
+                                             phi = nothing,
+                                             derivative = nothing,
+                                             )
+pde_system = PDESystem(eq,bcs,domains,[t],[i])
+prob = NeuralPDE.discretize(pde_system,discretization)
+res = GalacticOptim.solve(prob, BFGS(); cb = cb, maxiters=100)
+ts = [infimum(d.domain):0.01:supremum(d.domain) for d in domains][1]
+phi = discretization.phi
+
+analytic_sol_func(t) = 1/2*(exp(-t))*(sin(2*t))
+u_real  = [analytic_sol_func(t) for t in ts]
+
+u_predict  = [first(phi(t,res.minimizer)) for t in ts]
+
+@test Flux.mse(u_real, u_predict) < 0.001
+
+# plot(ts, u_real, label = "analytical")
+# plot!(ts, u_predict, label = "predicted")

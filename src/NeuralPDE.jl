@@ -17,7 +17,10 @@ using RuntimeGeneratedFunctions
 using SciMLBase
 using Statistics
 import Tracker, Optim
+using DomainSets
+using Symbolics
 import ModelingToolkit: value, nameof, toexpr, build_expr, expand_derivatives
+import DomainSets: Domain, ClosedInterval
 import ModelingToolkit: Interval, infimum, supremum #,Ball
 import SciMLBase: @add_kwonly
 using Flux: @nograd
